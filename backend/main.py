@@ -3,16 +3,7 @@ FlixCoin backend.
 
 FastAPI + async SQLite/PostgreSQL-ready architecture for a Telegram Mini App
 Watch-to-Earn video platform. This single-file version is intentionally compact
-for GitHub/demo onboarding, but it keeps production boundaries clear:
-
-- password hashing and bearer tokens
-- strict role checks for publisher/admin actions
-- anti-cheat strikes by IP and browser fingerprint
-- WebSocket fanout for instant feed updates
-- auditable SuperAdmin mutations
-
-For production, move models/repositories/services into separate modules and use
-PostgreSQL with managed secrets, TLS, and centralized logging.
+for GitHub/demo onboarding, but it keeps production boundaries clear.
 """
 
 from __future__ import annotations
@@ -24,6 +15,7 @@ import logging
 import os
 import secrets
 import sqlite3
+import json
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -45,12 +37,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 try:
     from passlib.context import CryptContext
-except Exception as exc:  # pragma: no cover - dependency guard for clean startup errors
+except Exception as exc:  
     raise RuntimeError("Install backend requirements: pip install fastapi uvicorn passlib[bcrypt] aiosqlite") from exc
 
 try:
     import aiosqlite
-except Exception as exc:  # pragma: no cover
+except Exception as exc:  
     raise RuntimeError("Install backend requirements: pip install aiosqlite") from exc
 
 
@@ -80,7 +72,6 @@ def iso_now() -> str:
 
 
 def db_path_from_url(url: str) -> str:
-    """This demo uses async SQLite. DATABASE_URL is shaped to be PostgreSQL-replaceable."""
     if url.startswith("sqlite+aiosqlite:///"):
         return url.replace("sqlite+aiosqlite:///", "", 1)
     if url.startswith("sqlite:///"):
@@ -154,8 +145,6 @@ class BanAppealRequest(BaseModel):
 
 
 class ConnectionManager:
-    """Small in-memory WebSocket fanout for local development."""
-
     def __init__(self) -> None:
         self.active: set[WebSocket] = set()
         self._lock = asyncio.Lock()
@@ -857,16 +846,9 @@ async def follow_user(
     return {"followed": True, "creator_reward": 1}
 
 
-@app.get("/admin/users/search")
-async def admin_search_user(
-    q: str,
-    user: Annotated[dict[str, Any], Depends(current_user)],
-) -> dict[str, list[dict[str, Any]]]:
-    require_superadmin(user)
-    async with await db() as conn:
-        rows = await fetch_all(conn, "SELECT * FROM users WHERE full_username LIKE ? ORDER BY id DESC LIMIT 20", (f"%{q}%",))
-    return {"users": [public_user(row) for row in rows]}
-
+# ==========================================
+#  YETISHMAYOTGAN ADMIN & WS ENDPOINTLARI (CHALA JOYI)
+# ==========================================
 
 @app.patch("/admin/users/{target_user_id}")
 async def admin_patch_user(
@@ -874,65 +856,92 @@ async def admin_patch_user(
     payload: AdminUserPatch,
     user: Annotated[dict[str, Any], Depends(current_user)],
 ) -> dict[str, Any]:
+    """SuperAdmin huquqiga ega bo'lgan foydalanuvchilar uchun mutatsiya amallari."""
     require_superadmin(user)
-    updates: list[str] = []
-    params: list[Any] = []
-    for field in ("coins", "follower_count", "like_count", "is_uploader", "is_superadmin", "is_banned"):
-        value = getattr(payload, field)
-        if value is not None:
-            updates.append(f"{field} = ?")
-            params.append(float(value) if field == "coins" else int(value) if isinstance(value, bool) else value)
-    if not updates:
-        raise HTTPException(status_code=400, detail="No changes submitted")
-
     async with await db() as conn:
-        before = await fetch_one(conn, "SELECT * FROM users WHERE id = ?", (target_user_id,))
-        if before is None:
-            raise HTTPException(status_code=404, detail="User not found")
+        before_row = await fetch_one(conn, "SELECT * FROM users WHERE id = ?", (target_user_id,))
+        if before_row is None:
+            raise HTTPException(status_code=404, detail="Target user not found")
+        
+        before_dict = public_user(before_row)
+        updates = []
+        params = []
+
+        if payload.coins is not None:
+            updates.append("coins = ?")
+            params.append(str(payload.coins))
+        if payload.follower_count is not None:
+            updates.append("follower_count = ?")
+            params.append(payload.follower_count)
+        if payload.like_count is not None:
+            updates.append("like_count = ?")
+            params.append(payload.like_count)
+        if payload.is_uploader is not None:
+            updates.append("is_uploader = ?")
+            params.append(int(payload.is_uploader))
+        if payload.is_superadmin is not None:
+            updates.append("is_superadmin = ?")
+            params.append(int(payload.is_superadmin))
+        if payload.is_banned is not None:
+            updates.append("is_banned = ?")
+            params.append(int(payload.is_banned))
+
+        if not updates:
+            return {"message": "No updates provided", "user": before_dict}
+
         params.append(target_user_id)
-        await conn.execute(f"UPDATE users SET {', '.join(updates)} WHERE id = ?", tuple(params))
-        after = await fetch_one(conn, "SELECT * FROM users WHERE id = ?", (target_user_id,))
+        query = f"UPDATE users SET {', '.join(updates)} WHERE id = ?"
+        await conn.execute(query, params)
+
+        after_row = await fetch_one(conn, "SELECT * FROM users WHERE id = ?", (target_user_id,))
+        assert after_row is not None
+        after_dict = public_user(after_row)
+
+        # Audit log yozish (Kim o'zgartirdi, nimani o'zgartirdi)
         await conn.execute(
             """
             INSERT INTO admin_audit_logs(admin_id, target_user_id, action, before_json, after_json, created_at)
-            VALUES (?, ?, 'user_patch', ?, ?, ?)
+            VALUES (?, ?, 'patch_user', ?, ?, ?)
             """,
-            (user["id"], target_user_id, str(public_user(before)), str(public_user(after)), iso_now()),
+            (user["id"], target_user_id, json.dumps(before_dict), json.dumps(after_dict), iso_now()),
         )
         await conn.commit()
-    return {"user": public_user(after)}
+    
+    return {"message": "User updated successfully", "user": after_dict}
 
 
-@app.post("/ban-appeals")
-async def create_ban_appeal(payload: BanAppealRequest, request: Request) -> dict[str, str]:
+@app.post("/auth/appeal")
+async def submit_appeal(payload: BanAppealRequest, request: Request) -> dict[str, str]:
+    """Banlangan foydalanuvchilar uchun apellyatsiya berish tizimi."""
     ip_address = client_ip(request)
-    token = request.headers.get("authorization", "").replace("Bearer ", "")
-    user_id: int | None = None
-    full_username: str | None = None
-    if token:
-        try:
-            token_data = verify_token(token)
-            user_id = token_data["id"]
-            full_username = token_data["full_username"]
-        except HTTPException:
-            pass
     async with await db() as conn:
+        # Oxirgi ochiq apellyatsiyani tekshirish (Spamming oldini olish uchun)
+        existing = await fetch_one(
+            conn, 
+            "SELECT id FROM ban_appeals WHERE fingerprint_hash = ? AND status = 'open'", 
+            (payload.fingerprint_hash,)
+        )
+        if existing:
+            raise HTTPException(status_code=429, detail="You already have a pending open appeal.")
+
         await conn.execute(
             """
-            INSERT INTO ban_appeals(user_id, full_username, fingerprint_hash, ip_address, message, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO ban_appeals(fingerprint_hash, ip_address, message, created_at)
+            VALUES (?, ?, ?, ?)
             """,
-            (user_id, full_username, payload.fingerprint_hash, ip_address, payload.message, iso_now()),
+            (payload.fingerprint_hash, ip_address, payload.message, iso_now()),
         )
         await conn.commit()
-    return {"status": "submitted"}
+    return {"status": "submitted", "message": "Appeal received. Admins will review your device pattern."}
 
 
-@app.websocket("/ws/feed")
-async def feed_socket(websocket: WebSocket) -> None:
+@app.websocket("/feed/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    """Mini App ichidagi real-time video yangiliklari uchun WebSocket ulagichi."""
     await manager.connect(websocket)
     try:
         while True:
+            # Ulanishni saqlab turish uchun shunchaki ping-pong yoki text tinglanadi
             await websocket.receive_text()
     except WebSocketDisconnect:
         await manager.disconnect(websocket)
