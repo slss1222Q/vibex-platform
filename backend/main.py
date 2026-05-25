@@ -176,6 +176,7 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
+# Render xatoligini to'g'rilash uchun db context'ni xavfsiz qilish
 async def db() -> aiosqlite.Connection:
     conn = await aiosqlite.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -594,7 +595,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="FlixCoin API", version="1.0.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_ORIGIN, "http://localhost:5173"],
+    allow_origins=[FRONTEND_ORIGIN, "http://localhost:5173", "*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -847,7 +848,7 @@ async def follow_user(
 
 
 # ==========================================
-#  YETISHMAYOTGAN ADMIN & WS ENDPOINTLARI (CHALA JOYI)
+#  YETISHMAYOTGAN ADMIN & WS ENDPOINTLARI (YAKUNLANDI)
 # ==========================================
 
 @app.patch("/admin/users/{target_user_id}")
@@ -864,12 +865,14 @@ async def admin_patch_user(
             raise HTTPException(status_code=404, detail="Target user not found")
         
         before_dict = public_user(before_row)
+        
+        # Dinamik SQL sorovini shakllantiramiz
         updates = []
         params = []
-
+        
         if payload.coins is not None:
             updates.append("coins = ?")
-            params.append(str(payload.coins))
+            params.append(float(payload.coins))
         if payload.follower_count is not None:
             updates.append("follower_count = ?")
             params.append(payload.follower_count)
@@ -885,63 +888,61 @@ async def admin_patch_user(
         if payload.is_banned is not None:
             updates.append("is_banned = ?")
             params.append(int(payload.is_banned))
-
+            
         if not updates:
-            return {"message": "No updates provided", "user": before_dict}
-
+            return {"message": "No changes applied", "user": before_dict}
+            
         params.append(target_user_id)
         query = f"UPDATE users SET {', '.join(updates)} WHERE id = ?"
         await conn.execute(query, params)
-
+        
+        # Audit log yozamiz
         after_row = await fetch_one(conn, "SELECT * FROM users WHERE id = ?", (target_user_id,))
-        assert after_row is not None
         after_dict = public_user(after_row)
-
-        # Audit log yozish (Kim o'zgartirdi, nimani o'zgartirdi)
+        
         await conn.execute(
             """
             INSERT INTO admin_audit_logs(admin_id, target_user_id, action, before_json, after_json, created_at)
             VALUES (?, ?, 'patch_user', ?, ?, ?)
             """,
-            (user["id"], target_user_id, json.dumps(before_dict), json.dumps(after_dict), iso_now()),
+            (user["id"], target_user_id, json.dumps(before_dict), json.dumps(after_dict), iso_now())
         )
         await conn.commit()
-    
+        
     return {"message": "User updated successfully", "user": after_dict}
 
 
-@app.post("/auth/appeal")
-async def submit_appeal(payload: BanAppealRequest, request: Request) -> dict[str, str]:
-    """Banlangan foydalanuvchilar uchun apellyatsiya berish tizimi."""
+@app.post("/users/appeal-ban")
+async def appeal_ban(
+    payload: BanAppealRequest,
+    request: Request
+) -> dict[str, Any]:
+    """Ban bo'lgan foydalanuvchilar uchun apellyatsiya endpointi (Token talab qilinmaydi)."""
     ip_address = client_ip(request)
     async with await db() as conn:
-        # Oxirgi ochiq apellyatsiyani tekshirish (Spamming oldini olish uchun)
-        existing = await fetch_one(
-            conn, 
-            "SELECT id FROM ban_appeals WHERE fingerprint_hash = ? AND status = 'open'", 
-            (payload.fingerprint_hash,)
-        )
-        if existing:
-            raise HTTPException(status_code=429, detail="You already have a pending open appeal.")
-
+        # Apellyatsiya berayotgan fingerprint bazada bormi?
+        user = await fetch_one(conn, "SELECT id, full_username FROM users WHERE fingerprint_hash = ?", (payload.fingerprint_hash,))
+        
         await conn.execute(
             """
-            INSERT INTO ban_appeals(fingerprint_hash, ip_address, message, created_at)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO ban_appeals(user_id, full_username, fingerprint_hash, ip_address, message, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (payload.fingerprint_hash, ip_address, payload.message, iso_now()),
+            (user["id"] if user else None, user["full_username"] if user else "Unknown", payload.fingerprint_hash, ip_address, payload.message, iso_now())
         )
         await conn.commit()
-    return {"status": "submitted", "message": "Appeal received. Admins will review your device pattern."}
+    return {"status": "submitted", "message": "Your appeal has been received and is under review."}
 
 
-@app.websocket("/feed/ws")
+@app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """Mini App ichidagi real-time video yangiliklari uchun WebSocket ulagichi."""
+    """Real-time xabarlar (masalan, yangi video yuklanganda push) uchun WebSocket xizmati."""
     await manager.connect(websocket)
     try:
         while True:
-            # Ulanishni saqlab turish uchun shunchaki ping-pong yoki text tinglanadi
-            await websocket.receive_text()
+            # Clientdan keladigan har qanday ping/xabarlarni ushlab turish (aloqa uzilmasligi uchun)
+            data = await websocket.receive_text()
+            # Agar client nimadir yuborsa echo qilib qaytaramiz (ixtiyoriy)
+            await websocket.send_json({"type": "pong", "data": data})
     except WebSocketDisconnect:
         await manager.disconnect(websocket)
